@@ -69,7 +69,7 @@ def train(argv):
     dataset = datasets.CIFAR10(
         root="./data",
         train=True,
-        download=True,
+        download=False,
         transform=transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(),
