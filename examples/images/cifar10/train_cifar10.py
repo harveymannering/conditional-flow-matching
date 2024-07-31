@@ -11,7 +11,7 @@ from absl import app, flags
 from torchdyn.core import NeuralODE
 from torchvision import datasets, transforms
 from tqdm import trange
-from utils_cifar import ema, generate_samples, infiniteloop
+from utils_cifar import ema, generate_samples, generate_conditional_samples, infiniteloop, sample_plan, ClassSeparatedCIFAR10, NonOverlappingClassSampler, sample_conditional_pt
 
 from torchcfm.conditional_flow_matching import (
     ConditionalFlowMatcher,
@@ -66,41 +66,65 @@ def train(argv):
     )
 
     # DATASETS/DATALOADER
-    dataset = datasets.CIFAR10(
-        root="./data",
-        train=True,
-        download=False,
-        transform=transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
-        ),
+    transform=transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
     )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=FLAGS.batch_size,
-        shuffle=True,
-        num_workers=FLAGS.num_workers,
-        drop_last=True,
-    )
+
+    if FLAGS.model == "mmotcfm":
+        # Test the dataloader
+        dataset = ClassSeparatedCIFAR10(root='./data', train=True, transform=transform)
+        sampler = NonOverlappingClassSampler(dataset, FLAGS.batch_size)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler, num_workers=FLAGS.num_workers)
+    else:
+        dataset = datasets.CIFAR10(
+            root="./data",
+            train=True,
+            download=False,
+            transform=transform,
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=FLAGS.batch_size,
+            shuffle=True,
+            num_workers=FLAGS.num_workers,
+            drop_last=True,
+        )
 
     datalooper = infiniteloop(dataloader)
 
     # MODELS
-    net_model = UNetModelWrapper(
-        dim=(3, 32, 32),
-        num_res_blocks=2,
-        num_channels=FLAGS.num_channel,
-        channel_mult=[1, 2, 2, 2],
-        num_heads=4,
-        num_head_channels=64,
-        attention_resolutions="16",
-        dropout=0.1,
-    ).to(
-        device
-    )  # new dropout + bs of 128
+    if FLAGS.model == "cc-otcfm" or FLAGS.model == "mmotcfm" :
+        net_model = UNetModelWrapper(
+            dim=(3, 32, 32),
+            num_res_blocks=2,
+            num_channels=FLAGS.num_channel,
+            channel_mult=[1, 2, 2, 2],
+            num_heads=4,
+            class_cond=True,
+            num_classes=10,
+            num_head_channels=64,
+            attention_resolutions="16",
+            dropout=0.1,
+        ).to(
+            device
+        )  # new dropout + bs of 128
+    else:
+        net_model = UNetModelWrapper(
+            dim=(3, 32, 32),
+            num_res_blocks=2,
+            num_channels=FLAGS.num_channel,
+            channel_mult=[1, 2, 2, 2],
+            num_heads=4,
+            num_head_channels=64,
+            attention_resolutions="16",
+            dropout=0.1,
+        ).to(
+            device
+        )  # new dropout + bs of 128
 
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
@@ -123,7 +147,11 @@ def train(argv):
     #################################
 
     sigma = 0.0
-    if FLAGS.model == "otcfm":
+    if FLAGS.model == "mmotcfm":
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "cc-otcfm":
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
+    elif FLAGS.model == "otcfm":
         FM = ExactOptimalTransportConditionalFlowMatcher(sigma=sigma)
     elif FLAGS.model == "icfm":
         FM = ConditionalFlowMatcher(sigma=sigma)
@@ -133,7 +161,7 @@ def train(argv):
         FM = VariancePreservingConditionalFlowMatcher(sigma=sigma)
     else:
         raise NotImplementedError(
-            f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
+            f"Unknown model {FLAGS.model}, must be one of ['mmotcfm', 'cc-otcfm', 'otcfm', 'icfm', 'fm', 'si']"
         )
 
     savedir = FLAGS.output_dir + FLAGS.model + "/"
@@ -142,10 +170,33 @@ def train(argv):
     with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
         for step in pbar:
             optim.zero_grad()
-            x1 = next(datalooper).to(device)
+            x1, y1 = next(datalooper)
             x0 = torch.randn_like(x1)
-            t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-            vt = net_model(t, xt)
+            if FLAGS.model == "mmotcfm" :
+                # mmot sinkhorn
+                x0, x1, x2, _, y1, y2 = sample_plan(
+                    x0[:FLAGS.batch_size].numpy(), 
+                    x1[:FLAGS.batch_size].numpy(), 
+                    x1[FLAGS.batch_size:].numpy(), 
+                    None, 
+                    y1[:FLAGS.batch_size],
+                    y1[FLAGS.batch_size:]
+                )
+                
+                x0, x1, x2 = torch.tensor(x0), torch.tensor(x1), torch.tensor(x2)
+                x1 = torch.concat([x1[:FLAGS.batch_size//2], x2[FLAGS.batch_size//2:]], axis=0)
+                y1 = torch.concat([y1[:FLAGS.batch_size//2], y2[FLAGS.batch_size//2:]], axis=0)
+                t = torch.rand(x0.shape[0]).type_as(x0)
+                xt = sample_conditional_pt(x0, x1, t, sigma=sigma)
+                ut = x1 - x0
+                t, xt, y1, ut = t.to(device), xt.to(device), y1.to(device), ut.to(device)
+                vt = net_model(t, xt, y1)
+            elif FLAGS.model == "cc-otcfm": 
+                t, xt, ut, _, y1 = FM.guided_sample_location_and_conditional_flow(x0, x1, None, y1)
+                vt = net_model(t, xt, y1)
+            else:
+                t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
+                vt = net_model(t, xt)
             loss = torch.mean((vt - ut) ** 2)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
@@ -155,8 +206,13 @@ def train(argv):
 
             # sample and Saving the weights
             if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
-                generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
-                generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+                if FLAGS.model == "cc-otcfm" or FLAGS.model == "mmotcfm":
+                    generate_conditional_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
+                    generate_conditional_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+                else:
+                    generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
+                    generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+
                 torch.save(
                     {
                         "net_model": net_model.state_dict(),
