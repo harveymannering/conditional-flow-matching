@@ -315,7 +315,7 @@ def sample_plan(x0, x1, x2, y0, y1, y2, cost_fn='perimeter'):
             x2[k],
             y0[i] if y0 is not None else None,
             y1[j] if y1 is not None else None,
-            y2[j] if y2 is not None else None,
+            y2[k] if y2 is not None else None,
         )
 
 def sample_conditional_pt(x0, x1, t, sigma):
